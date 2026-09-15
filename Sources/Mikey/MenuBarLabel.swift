@@ -6,9 +6,10 @@ public func elapsedString(_ seconds: TimeInterval) -> String {
     return String(format: "%02d:%02d", total / 60, total % 60)
 }
 
-/// The menu-bar icon. Idle: static mic glyph. Recording: filled dot + elapsed
-/// `mm:ss`, refreshed on a timeline. (The pulsing animation arrives with the
-/// trust-polish ticket.)
+/// The menu-bar icon. Idle: static mic glyph. Recording: a pulsing red dot +
+/// elapsed `mm:ss` (SPEC §2). All live data comes from the single ticker
+/// publishing into `AppState` — the view holds no timer of its own: the dot's
+/// opacity follows `recordingPulse`, which the ticker flips each beat.
 public struct MenuBarLabel: View {
     let appState: AppState
 
@@ -21,12 +22,18 @@ public struct MenuBarLabel: View {
         case .idle:
             Image(systemName: "mic")
         case .recording:
-            TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                HStack(spacing: 3) {
-                    Image(systemName: "record.circle.fill")
-                    Text(elapsedString(appState.elapsedTime))
-                        .monospacedDigit()
-                }
+            HStack(spacing: 3) {
+                Image(systemName: "record.circle.fill")
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.red)
+                    .symbolEffect(.pulse, options: .repeating)
+                    .opacity(appState.recordingPulse ? 1 : 0.35)
+                    .animation(
+                        .easeInOut(duration: 0.3),
+                        value: appState.recordingPulse
+                    )
+                Text(elapsedString(appState.elapsedTime))
+                    .monospacedDigit()
             }
         }
     }
