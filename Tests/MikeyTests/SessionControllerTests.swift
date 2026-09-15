@@ -37,7 +37,9 @@ struct SessionControllerTests {
         let session = try await controller.startSession()
 
         #expect(engine.requestAccessCalls == 1)
-        #expect(engine.startedURL == session.fileURL)
+        // The engine captures to the `.caf` sibling; the Session's fileURL is
+        // the `.m4a` it finalizes to.
+        #expect(engine.startedURL == CaptureFile.url(for: session.fileURL))
         #expect(session.startedAt == Self.sessionStart)
         #expect(
             session.fileURL.path(percentEncoded: false)
@@ -75,12 +77,19 @@ struct SessionControllerTests {
         defer { try? FileManager.default.removeItem(at: tempDir) }
         let session = try await controller.startSession()
 
-        controller.stopSession(session)
+        await controller.stopSession(session)
 
         #expect(engine.stopCalls == 1)
         #expect(notifier.posted.count == 1)
         #expect(notifier.posted.first?.title == "Recording stopped")
         #expect(notifier.posted.first?.body == "2026-09-15_10-30.m4a")
+        // Stop finalizes: the `.m4a` exists and the `.caf` is gone.
+        #expect(FileManager.default.fileExists(
+            atPath: session.fileURL.path(percentEncoded: false)
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: CaptureFile.url(for: session.fileURL).path(percentEncoded: false)
+        ))
     }
 
     @Test func elapsedAndLevelPassThroughFromEngine() {

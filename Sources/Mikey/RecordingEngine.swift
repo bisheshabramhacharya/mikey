@@ -3,7 +3,7 @@ import AVFoundation
 import Foundation
 import os
 
-/// The capture half of a Session: microphone → incremental `.m4a` on disk.
+/// The capture half of a Session: microphone → incremental audio on disk.
 /// Behind a protocol so tests can fake mic input.
 public protocol RecordingEngine: AnyObject, Sendable {
     /// True between `start(to:)` and `stop()`.
@@ -12,17 +12,25 @@ public protocol RecordingEngine: AnyObject, Sendable {
     var elapsedTime: TimeInterval { get }
     /// Linear RMS level (0…1) of the most recently captured input buffer.
     var inputLevel: Float { get }
+    /// Invoked on the main thread when capture stops on its own — e.g. the
+    /// input device was lost mid-recording and reattachment failed. The
+    /// capture file is already closed on disk; SessionController finalizes
+    /// the `.m4a`, clears the `.recording` marker, and notifies.
+    var onCaptureStopped: (@Sendable () -> Void)? { get set }
 
     /// Ensures TCC microphone permission, prompting the user on first use.
     func requestAccess() async -> Bool
     /// Starts capturing to `url`; throws if capture can't begin.
     func start(to url: URL) throws
-    /// Ends capture and finalizes the file. Safe to call when not recording.
+    /// Ends capture and closes the capture file. Safe to call when not
+    /// recording.
     func stop()
 }
 
-/// `RecordingEngine` backed by AVAudioEngine: input-node tap → format convert →
-/// `M4AWriter`. Mic only — no system audio.
+/// `RecordingEngine` backed by AVAudioEngine: input-node tap → gain stage →
+/// format convert → `CAFCaptureWriter` (PCM `.caf` — crash-safe, unlike a
+/// half-written `.m4a`; finalized to `.m4a` on stop). Mic only — no system
+/// audio.
 public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
     public enum Failure: LocalizedError {
         case noInputDevice
@@ -38,17 +46,42 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
         }
     }
 
+    /// Buffer size requested from the input tap, at each install.
+    private static let tapBufferSize: AVAudioFrameCount = 4096
+
     private let engine = AVAudioEngine()
-    private var writer: M4AWriter?
+    private let gainStage: GainStage
+    private var writer: CAFCaptureWriter?
     private var converter: AVAudioConverter?
+    private var configChangeObserver: NSObjectProtocol?
 
     // Written on the realtime tap thread, read on the main thread.
     private let level = OSAllocatedUnfairLock<Float>(initialState: 0)
     private let writtenFrames = OSAllocatedUnfairLock<AVAudioFramePosition>(initialState: 0)
 
     public private(set) var isRecording = false
+    public var onCaptureStopped: (@Sendable () -> Void)?
 
-    public init() {}
+    /// `gainDB` is the engine's capture boost; once `config.json` lands the
+    /// configured value is passed here instead of `GainStage.defaultGainDB`.
+    public init(gainDB: Double = GainStage.defaultGainDB) {
+        gainStage = GainStage(gainDB: gainDB)
+        // Device plug/unplug or a new default input mid-recording lands here;
+        // handled on main so reattach never races the realtime tap thread.
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleConfigurationChange()
+        }
+    }
+
+    deinit {
+        if let configChangeObserver {
+            NotificationCenter.default.removeObserver(configChangeObserver)
+        }
+    }
 
     public var inputLevel: Float { level.withLock { $0 } }
 
@@ -73,7 +106,7 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
     public func start(to url: URL) throws {
         stop() // defensive: a prior Session must be fully torn down
 
-        let writer = try M4AWriter(url: url)
+        let writer = try CAFCaptureWriter(url: url)
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
@@ -88,7 +121,7 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
         level.withLock { $0 = 0 }
 
         do {
-            input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) {
+            input.installTap(onBus: 0, bufferSize: Self.tapBufferSize, format: inputFormat) {
                 [weak self] buffer, _ in
                 self?.processInput(buffer)
             }
@@ -115,10 +148,13 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
         isRecording = false
     }
 
-    /// Runs on the realtime tap thread: updates the level meter, converts to
-    /// the recording format, and appends to the `.m4a`.
+    /// Runs on the realtime tap thread: updates the level meter (raw input —
+    /// it should show what the mic hears, not the boosted signal), applies
+    /// gain + soft limiting, converts to the capture format, and appends
+    /// to the `.caf`.
     private func processInput(_ buffer: AVAudioPCMBuffer) {
         updateLevel(buffer)
+        gainStage.process(buffer)
         guard let converter, let writer else { return }
 
         let capacity = AVAudioFrameCount(
@@ -156,5 +192,48 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
         }
         let newLevel = min(peak, 1)
         level.withLock { $0 = newLevel }
+    }
+
+    /// Input device changed mid-capture (unplugged, or macOS switched the
+    /// default). Runs on the main queue. Reattach the tap to whatever the
+    /// input node offers now and keep writing the same `.caf`; if there's no
+    /// usable input, end capture — the partial file stays valid either way
+    /// (SPEC §7).
+    private func handleConfigurationChange() {
+        guard isRecording, let writer else { return }
+        let input = engine.inputNode
+        // Drains any in-flight tap callback, so writer/converter swaps below
+        // can't race the realtime thread.
+        input.removeTap(onBus: 0)
+
+        let newFormat = input.outputFormat(forBus: 0)
+        guard newFormat.sampleRate > 0, newFormat.channelCount > 0,
+              let newConverter = AVAudioConverter(from: newFormat, to: writer.format)
+        else {
+            interruptCapture()
+            return
+        }
+        converter = newConverter
+        input.installTap(onBus: 0, bufferSize: Self.tapBufferSize, format: newFormat) {
+            [weak self] buffer, _ in
+            self?.processInput(buffer)
+        }
+        do {
+            if !engine.isRunning { try engine.start() }
+        } catch {
+            interruptCapture()
+        }
+    }
+
+    /// The input is gone for good: finalize what's on disk and hand off to
+    /// SessionController (via `onCaptureStopped`) to end the Session.
+    private func interruptCapture() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        writer?.finish()
+        writer = nil
+        converter = nil
+        isRecording = false
+        onCaptureStopped?()
     }
 }
