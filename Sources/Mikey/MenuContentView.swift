@@ -17,18 +17,18 @@ public struct MenuContentView: View {
                 Task { await appState.quickRecord() }
             }
         case .recording:
-            TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                Button("Stop Recording — \(elapsedString(appState.elapsedTime))") {
-                    appState.stopRecording()
-                }
+            // Elapsed + meter both read the ticker's published snapshot —
+            // no per-view timers (SPEC §2).
+            Button("■ Stop Recording — \(elapsedString(appState.elapsedTime))") {
+                appState.stopRecording()
             }
-            TimelineView(.periodic(from: .now, by: 0.2)) { _ in
-                // Room-tone speech is RMS ≪ 1, so the bar is scaled to a
-                // quarter full-scale. The real meter UI is a later ticket.
-                LabeledContent("Input level") {
-                    ProgressView(value: Double(min(appState.inputLevel, 0.25) / 0.25))
-                        .frame(width: 80)
-                }
+            // Live proof the mic hears the room. Room-tone speech is RMS ≪ 1,
+            // so the bar is scaled to a quarter full-scale.
+            LabeledContent("Input level") {
+                ProgressView(
+                    value: Double(min(appState.inputLevel, 0.25) / 0.25)
+                )
+                .frame(width: 80)
             }
         }
 
