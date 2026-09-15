@@ -1,15 +1,19 @@
 import Foundation
 
-/// A single recorded class meeting — here always a Quick Record (courseless).
-/// Its Recording is one `.m4a` written to `fileURL`.
+/// A single recorded class meeting. Its Recording is one `.m4a` written to
+/// `fileURL`; `courseName` is the Course it belongs to, or nil for a
+/// Quick Record Session filed under `Unsorted/`.
 public struct Session: Equatable, Sendable {
     /// Where this Session's Recording lands in the Archive.
     public let fileURL: URL
     public let startedAt: Date
+    /// The Course picked in the menu (e.g. "CHEM 101"); nil for Quick Record.
+    public let courseName: String?
 
-    public init(fileURL: URL, startedAt: Date) {
+    public init(fileURL: URL, startedAt: Date, courseName: String? = nil) {
         self.fileURL = fileURL
         self.startedAt = startedAt
+        self.courseName = courseName
     }
 }
 
@@ -36,7 +40,9 @@ public final class SessionController {
     }
 
     private let engine: any RecordingEngine
-    private let archive: Archive
+    /// The Archive this controller files Sessions into. Exposed so AppState
+    /// can resolve Course folders and create the layout from the same root.
+    public let archive: Archive
     private let clock: any Clock
     private let notifier: any NotificationPosting
 
@@ -56,15 +62,16 @@ public final class SessionController {
     public var elapsedTime: TimeInterval { engine.elapsedTime }
     public var inputLevel: Float { engine.inputLevel }
 
-    /// Starts a Quick Record Session filed under `Archive/Unsorted/`.
-    public func startSession() async throws -> Session {
+    /// Starts a Session. With a `course` the `.m4a` files under that Course's
+    /// folder; with nil it's a Quick Record filed under `Archive/Unsorted/`.
+    public func startSession(course: CourseFolder? = nil) async throws -> Session {
         guard await engine.requestAccess() else {
             throw Failure.microphoneAccessDenied
         }
         let startedAt = clock.now
         let url: URL
         do {
-            url = try archive.newSessionURL(at: startedAt)
+            url = try archive.newSessionURL(at: startedAt, in: course?.folder)
         } catch {
             throw Failure.archiveUnavailable(error.localizedDescription)
         }
@@ -73,7 +80,7 @@ public final class SessionController {
         } catch {
             throw Failure.captureFailed(error.localizedDescription)
         }
-        return Session(fileURL: url, startedAt: startedAt)
+        return Session(fileURL: url, startedAt: startedAt, courseName: course?.name)
     }
 
     /// Ends the Session: capture stops, the `.m4a` is finalized, and a
@@ -82,7 +89,10 @@ public final class SessionController {
         engine.stop()
         notifier.post(
             title: "Recording stopped",
-            body: session.fileURL.lastPathComponent
+            // "CHEM 101 — 2026-09-15_10-30.m4a"; Quick Record stays filename-only.
+            body: [session.courseName, session.fileURL.lastPathComponent]
+                .compactMap { $0 }
+                .joined(separator: " — ")
         )
     }
 }

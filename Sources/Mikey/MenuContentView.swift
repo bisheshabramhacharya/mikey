@@ -13,12 +13,17 @@ public struct MenuContentView: View {
     public var body: some View {
         switch appState.recordingState {
         case .idle:
-            Button("Quick Record") {
+            ForEach(appState.courseFolders) { course in
+                Button("▶ \(course.name)") {
+                    Task { await appState.recordCourse(course) }
+                }
+            }
+            Button("▶ Quick Record") {
                 Task { await appState.quickRecord() }
             }
-        case .recording:
+        case .recording(let session):
             TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-                Button("Stop Recording — \(elapsedString(appState.elapsedTime))") {
+                Button("Stop Recording — \(session.courseName ?? "Quick Record") · \(elapsedString(appState.elapsedTime))") {
                     appState.stopRecording()
                 }
             }
@@ -36,10 +41,22 @@ public struct MenuContentView: View {
             Text(error)
         }
 
+        // Corrupt config → warning + fix affordance; the Course list is
+        // already empty and Quick Record above keeps working (SPEC §5, §7).
+        if case .corrupt(let detail) = appState.configState {
+            Button("⚠ Config error — click to fix") {
+                appState.editConfig()
+            }
+            Text(detail)
+        }
+
         Divider()
 
         Button("Open Archive Folder") {
             appState.openArchiveFolder()
+        }
+        Button("Edit Courses (config.json)") {
+            appState.editConfig()
         }
 
         Divider()
@@ -48,5 +65,8 @@ public struct MenuContentView: View {
             appState.quit()
         }
         .keyboardShortcut("q")
+        // `.menu`-style MenuBarExtra re-renders its content on every open, so
+        // this is the "reload config when the menu opens" hook — no watcher.
+        .onAppear { appState.reloadConfig() }
     }
 }

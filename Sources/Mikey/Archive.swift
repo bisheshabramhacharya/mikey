@@ -10,13 +10,16 @@ public struct Archive: Sendable {
         self.root = root
     }
 
-    /// Interim archive root; course folders and `config.json` arrive with the
-    /// courses ticket. For now every Session is a Quick Record under `Unsorted/`.
     /// (No `.isDirectory` hint — it would bake a trailing "/" into the URL's
     /// path, so the root wouldn't string-compare equal to `~/Documents/Mikey`.)
     public static func defaultRoot() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appending(path: "Documents/Mikey")
+    }
+
+    /// `<Archive>/config.json` — the user-editable configuration (SPEC §5).
+    public var configFileURL: URL {
+        root.appending(path: "config.json")
     }
 
     /// Where Quick Record Sessions are filed.
@@ -53,10 +56,77 @@ public struct Archive: Sendable {
         return candidate
     }
 
+    /// Course name → Archive folder name: "CHEM 101" → "CHEM-101". Runs of
+    /// non-alphanumerics collapse to single dashes; the result is uppercased.
+    /// A name with no usable characters falls back to "COURSE" (SPEC §4).
+    public static func slugify(_ course: String) -> String {
+        let slug = course
+            .components(separatedBy: .alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+            .uppercased()
+        return slug.isEmpty ? "COURSE" : slug
+    }
+
+    /// Resolves each configured Course to its Archive folder, in config order.
+    /// Two Courses slugifying to the same name are disambiguated with a
+    /// deterministic `-2`, `-3`, … suffix; `Unsorted` is reserved for Quick
+    /// Record, so a Course colliding with it is bumped the same way.
+    /// Comparison is lowercased because APFS is case-insensitive by default.
+    public func courseFolders(for courses: [String]) -> [CourseFolder] {
+        var used: Set<String> = [unsortedFolder.lastPathComponent.lowercased()]
+        return courses.map { name in
+            let slug = Self.slugify(name)
+            var candidate = slug
+            var suffix = 2
+            while used.contains(candidate.lowercased()) {
+                candidate = "\(slug)-\(suffix)"
+                suffix += 1
+            }
+            used.insert(candidate.lowercased())
+            return CourseFolder(
+                name: name,
+                folder: root.appending(path: candidate, directoryHint: .isDirectory)
+            )
+        }
+    }
+
+    /// Creates the Archive layout: the root, one folder per Course, and
+    /// `Unsorted/`. Only ever adds — folders and Recordings for Courses
+    /// removed from the config are left untouched (SPEC §7).
+    public func ensureLayout(courses: [String]) throws {
+        try createIfNeeded()
+        for course in courseFolders(for: courses) {
+            try FileManager.default.createDirectory(
+                at: course.folder,
+                withIntermediateDirectories: true
+            )
+        }
+        try FileManager.default.createDirectory(
+            at: unsortedFolder,
+            withIntermediateDirectories: true
+        )
+    }
+
     private static let sessionNameFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd_HH-mm"
         return formatter
     }()
+}
+
+/// A configured Course name paired with the Archive folder its Sessions file
+/// into. `name` is what the menu shows; `folder` is the resolved,
+/// collision-free `Archive/<slug>`.
+public struct CourseFolder: Equatable, Sendable, Identifiable {
+    public let name: String
+    public let folder: URL
+
+    public var id: URL { folder }
+
+    public init(name: String, folder: URL) {
+        self.name = name
+        self.folder = folder
+    }
 }
