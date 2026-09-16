@@ -62,7 +62,10 @@ public final class SessionController {
     /// generous headroom).
     public static let minimumFreeSpace: Int64 = 500 * 1024 * 1024
 
-    private let engine: any RecordingEngine
+    /// Internal (not private) so tests can verify which engine a configured
+    /// controller got — the `gainDB` wiring lives at AppState's
+    /// construction seam.
+    let engine: any RecordingEngine
     /// The Archive this controller files Sessions into. Exposed so AppState
     /// can resolve Course folders and create the layout from the same root.
     public let archive: Archive
