@@ -11,10 +11,23 @@ public final class AppState {
         case recording(Session)
     }
 
+    /// A fix-it action the menu can offer next to `lastError` when a failure
+    /// has a user remedy.
+    public enum ErrorFix {
+        /// Deep-link to System Settings → Privacy → Microphone.
+        case openMicrophoneSettings
+    }
+
     public private(set) var recordingState: RecordingState = .idle
     /// Human-readable failure shown in the menu (permission denied, no input
     /// device, …). Cleared on the next attempt.
     public private(set) var lastError: String?
+    /// The remedy button rendered beside `lastError`, if any.
+    public private(set) var errorFix: ErrorFix?
+    /// `.m4a` files recovered at launch from a Session that died mid-capture
+    /// (crash / force-quit). Surfaced once in the menu, cleared on the next
+    /// recording attempt.
+    public private(set) var recoveredFiles: [URL] = []
     /// Latest `config.json` load — refreshed every time the menu opens.
     public private(set) var configState: ConfigStore.State = .ok(.standard)
     /// Courses resolved to Archive folders, in config order. Empty while the
@@ -51,9 +64,27 @@ public final class AppState {
         self.configStore = configStore ?? ConfigStore(archive: sessions.archive)
         self.ticker = ticker
         self.quitFlow = quitFlow
+        sessions.onSessionInterrupted = { [weak self] session in
+            guard let self,
+                  case .recording(let current) = self.recordingState,
+                  current == session else { return }
+            // The controller finalizes the file itself — we just leave the
+            // recording UI state and stop the ticker.
+            self.ticker.stop()
+            self.recordingState = .idle
+            self.elapsedTime = 0
+            self.inputLevel = 0
+            self.recordingPulse = false
+        }
         // First launch: write `config.json` + lay out the Archive before the
         // menu is ever opened (SPEC §5).
         reloadConfig()
+        // Recovery transcodes leftover `.caf` captures — real work, so it
+        // runs off the init path and lands here when done.
+        Task { [weak self] in
+            let recovered = await sessions.recoverInterruptedSessions()
+            self?.recoveredFiles = recovered
+        }
     }
 
     public var archiveURL: URL { sessions.archiveURL }
@@ -94,6 +125,8 @@ public final class AppState {
     ) async {
         guard recordingState == .idle else { return }
         lastError = nil
+        errorFix = nil
+        recoveredFiles = []
         do {
             let session = try await start(sessions)
             elapsedTime = 0
@@ -105,10 +138,15 @@ public final class AppState {
             }
         } catch {
             lastError = error.localizedDescription
+            if let failure = error as? SessionController.Failure,
+               case .microphoneAccessDenied = failure {
+                errorFix = .openMicrophoneSettings
+            }
         }
     }
 
-    /// Menu action: `■ Stop Recording`. Finalizes the `.m4a`.
+    /// Menu action: `■ Stop Recording`. Ends capture immediately, then
+    /// finalizes the `.m4a` in the background (transcode of the `.caf`).
     public func stopRecording() {
         guard case .recording(let session) = recordingState else { return }
         finishRecording(session, reason: .manual)
@@ -129,14 +167,33 @@ public final class AppState {
         NSWorkspace.shared.open(configStore.fileURL)
     }
 
+    /// Menu action shown when mic permission is denied — deep-links to
+    /// System Settings → Privacy → Microphone (SPEC §7).
+    public func openMicrophoneSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     /// Menu action: `Quit Mikey`. Quitting mid-Session warns first (SPEC §7):
-    /// confirm runs the normal finalize path, cancel keeps recording.
+    /// confirm runs the normal finalize path (async — the `.caf` transcode
+    /// must finish before terminate), cancel keeps recording.
     public func quit() {
-        if case .recording = recordingState {
-            guard quitFlow.confirmQuitWhileRecording() else { return }
-            stopRecording()
+        guard case .recording(let session) = recordingState else {
+            quitFlow.terminateNow()
+            return
         }
-        quitFlow.terminateNow()
+        guard quitFlow.confirmQuitWhileRecording() else { return }
+        ticker.stop()
+        recordingState = .idle
+        elapsedTime = 0
+        inputLevel = 0
+        recordingPulse = false
+        Task {
+            await sessions.stopSession(session, reason: .manual)
+            quitFlow.terminateNow()
+        }
     }
 
     /// One ticker heartbeat: republish the live snapshot the views observe,
@@ -153,18 +210,19 @@ public final class AppState {
     }
 
     /// The single clean-stop path every exit takes — manual stop, auto-stop at
-    /// the cap, and quit-confirm: halt the ticker, stop + finalize + release
-    /// the sleep assertion in `stopSession`, then reset the UI snapshot.
+    /// the cap: halt the ticker, reset the UI snapshot, then `stopSession`
+    /// stops capture + releases the sleep assertion + finalizes the `.m4a`
+    /// (async — the `.caf` transcode is real work).
     private func finishRecording(
         _ session: Session,
         reason: SessionController.StopReason
     ) {
         ticker.stop()
-        sessions.stopSession(session, reason: reason)
         recordingState = .idle
         elapsedTime = 0
         inputLevel = 0
         recordingPulse = false
+        Task { await sessions.stopSession(session, reason: reason) }
     }
 }
 

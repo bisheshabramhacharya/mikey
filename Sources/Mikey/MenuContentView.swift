@@ -37,8 +37,20 @@ public struct MenuContentView: View {
             }
         }
 
+        if !appState.recoveredFiles.isEmpty {
+            Text("Recovered after an unexpected quit: \(appState.recoveredFiles.map(\.lastPathComponent).joined(separator: ", "))")
+        }
+
         if let error = appState.lastError {
             Text(error)
+            if let fix = appState.errorFix {
+                switch fix {
+                case .openMicrophoneSettings:
+                    Button("Open Microphone Settings…") {
+                        appState.openMicrophoneSettings()
+                    }
+                }
+            }
         }
 
         // Corrupt config → warning + fix affordance; the Course list is

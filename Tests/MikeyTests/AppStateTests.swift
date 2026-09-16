@@ -41,7 +41,8 @@ struct AppStateTests {
             Issue.record("expected .recording, got \(appState.recordingState)")
             return
         }
-        #expect(session.fileURL == engine.startedURL)
+        // Engine captures to the `.caf`; the Session is named by its `.m4a`.
+        #expect(engine.startedURL == CaptureFile.url(for: session.fileURL))
         #expect(appState.lastError == nil)
     }
 
@@ -51,7 +52,14 @@ struct AppStateTests {
         appState.stopRecording()
 
         #expect(appState.recordingState == .idle)
+        // Stop finalizes on a background task — pump until it lands.
+        for _ in 0..<100 where engine.stopCalls == 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         #expect(engine.stopCalls == 1)
+        for _ in 0..<100 where notifier.posted.isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         #expect(notifier.posted.count == 1)
     }
 

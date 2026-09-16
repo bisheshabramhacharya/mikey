@@ -79,7 +79,9 @@ struct CourseSessionTests {
                 == tempDir.appending(path: "CHEM-101/2026-09-15_10-30.m4a")
                     .path(percentEncoded: false)
         )
-        #expect(engine.startedURL == session.fileURL)
+        // Live capture goes to the crash-safe `.caf` sibling; `fileURL` is
+        // the `.m4a` produced on finalize (#5).
+        #expect(engine.startedURL == CaptureFile.url(for: session.fileURL))
     }
 
     @Test func quickRecordStillFilesToUnsorted() async throws {

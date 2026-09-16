@@ -49,7 +49,18 @@ public struct Archive: Sendable {
         let base = Self.sessionNameFormatter.string(from: date)
         var candidate = folder.appending(path: "\(base).m4a")
         var suffix = 2
-        while FileManager.default.fileExists(atPath: candidate.path(percentEncoded: false)) {
+        // Also skip stems still claimed by a live capture (`.caf`) or a
+        // leftover `.recording` marker — reusing one would overwrite audio a
+        // crashed Session left behind for recovery.
+        func stemClaimed(_ audio: URL) -> Bool {
+            let fileManager = FileManager.default
+            return fileManager.fileExists(atPath: audio.path(percentEncoded: false))
+                || fileManager.fileExists(
+                    atPath: CaptureFile.url(for: audio).path(percentEncoded: false))
+                || fileManager.fileExists(
+                    atPath: RecordingMarker.url(for: audio).path(percentEncoded: false))
+        }
+        while stemClaimed(candidate) {
             candidate = folder.appending(path: "\(base)-\(suffix).m4a")
             suffix += 1
         }

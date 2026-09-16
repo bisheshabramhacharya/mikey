@@ -110,8 +110,10 @@ struct RecordingTrustTests {
         ticker.fire()
 
         #expect(appState.recordingState == .idle)
-        #expect(engine.stopCalls == 1)
         #expect(ticker.stopCalls == 1)
+        // Stop → finalize is async (the `.caf` transcode): wait for it.
+        #expect(await waitUntil { engine.stopCalls == 1 })
+        #expect(await waitUntil { !notifier.posted.isEmpty })
         #expect(notifier.posted.first?.title == "Recording auto-stopped (75:00)")
     }
 
@@ -148,7 +150,8 @@ struct RecordingTrustTests {
 
         ticker.fire()
 
-        #expect(engine.stopCalls == 1)
+        #expect(await waitUntil { engine.stopCalls == 1 })
+        #expect(await waitUntil { !notifier.posted.isEmpty })
         #expect(notifier.posted.first?.title == "Recording auto-stopped (01:00)")
     }
 
@@ -163,7 +166,7 @@ struct RecordingTrustTests {
         #expect(sleepAssertion.isHeld == true)
 
         appState.stopRecording()
-        #expect(sleepAssertion.endCalls == 1)
+        #expect(await waitUntil { sleepAssertion.endCalls == 1 })
         #expect(sleepAssertion.isHeld == false)
     }
 
@@ -174,7 +177,7 @@ struct RecordingTrustTests {
 
         ticker.fire()
 
-        #expect(sleepAssertion.endCalls == 1)
+        #expect(await waitUntil { sleepAssertion.endCalls == 1 })
         #expect(sleepAssertion.isHeld == false)
     }
 
@@ -201,9 +204,10 @@ struct RecordingTrustTests {
 
         #expect(quitFlow.confirmCalls == 1)
         #expect(appState.recordingState == .idle)
-        #expect(engine.stopCalls == 1)
+        // Finalize (transcode) then terminate happen on the async stop path.
+        #expect(await waitUntil { engine.stopCalls == 1 })
+        #expect(await waitUntil { quitFlow.terminateCalls == 1 })
         #expect(sleepAssertion.isHeld == false)
-        #expect(quitFlow.terminateCalls == 1)
     }
 
     @Test func quitWhileRecordingCancelKeepsRecording() async {
@@ -230,6 +234,21 @@ struct RecordingTrustTests {
         #expect(quitFlow.confirmCalls == 0)
         #expect(quitFlow.terminateCalls == 1)
     }
+}
+
+/// Waits briefly for an async condition (stop finalizes on a Task — the
+/// `.caf` transcode is real work, same helper as in CrashProofingTests).
+@MainActor
+private func waitUntil(
+    _ timeoutNanoseconds: UInt64 = 2_000_000_000,
+    _ condition: () -> Bool
+) async -> Bool {
+    var waited: UInt64 = 0
+    while !condition() && waited < timeoutNanoseconds {
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        waited += 10_000_000
+    }
+    return condition()
 }
 
 /// Manual-fire `Ticker`: tests control exactly when beats land.
