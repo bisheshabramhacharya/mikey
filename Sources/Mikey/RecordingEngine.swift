@@ -50,6 +50,9 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
     private static let tapBufferSize: AVAudioFrameCount = 4096
 
     private let engine = AVAudioEngine()
+    /// The configured capture boost, kept readable so the config→engine
+    /// wiring is verifiable in tests.
+    public let gainDB: Double
     private let gainStage: GainStage
     private var writer: CAFCaptureWriter?
     private var converter: AVAudioConverter?
@@ -62,9 +65,11 @@ public final class MicRecordingEngine: RecordingEngine, @unchecked Sendable {
     public private(set) var isRecording = false
     public var onCaptureStopped: (@Sendable () -> Void)?
 
-    /// `gainDB` is the engine's capture boost; once `config.json` lands the
-    /// configured value is passed here instead of `GainStage.defaultGainDB`.
+    /// `gainDB` is the engine's capture boost — the `config.json` key,
+    /// passed in by the construction seam that read the file
+    /// (`GainStage.defaultGainDB` only when there is no config).
     public init(gainDB: Double = GainStage.defaultGainDB) {
+        self.gainDB = gainDB
         gainStage = GainStage(gainDB: gainDB)
         // Device plug/unplug or a new default input mid-recording lands here;
         // handled on main so reattach never races the realtime tap thread.

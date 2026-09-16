@@ -143,3 +143,18 @@ final class FakeModelDownloadConsent: ModelDownloadConsent, @unchecked Sendable 
         return grant
     }
 }
+
+/// Fake login-items database. `isEnabled` is the stored registration, so it
+/// survives a fresh `AppState` — that's the "survives reboot" seam, since the
+/// real store is the OS's own registration.
+final class FakeLaunchAtLogin: LaunchAtLogin, @unchecked Sendable {
+    var isEnabled = false
+    private(set) var setEnabledCalls: [Bool] = []
+    var setEnabledError: (any Error)?
+
+    func setEnabled(_ enabled: Bool) throws {
+        setEnabledCalls.append(enabled)
+        if let setEnabledError { throw setEnabledError }
+        isEnabled = enabled
+    }
+}

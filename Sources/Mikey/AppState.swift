@@ -63,6 +63,17 @@ public final class AppState {
     /// "job N of M" line. `nil` when no queue is running; a single
     /// `transcribe(_:)` doesn't set it.
     public private(set) var transcriptionQueue: QueueProgress?
+    /// Whether the app is registered to launch at login — the menu's
+    /// `Launch at Login` toggle reads this. Re-read from the system's
+    /// login-items database on every menu open, since the user can also
+    /// flip it in System Settings (SPEC §2, §5).
+    public private(set) var launchAtLoginEnabled = false
+
+    /// True while any transcription work is in flight — a job running or a
+    /// queue between jobs. Drives the menu bar's "working" glyph (SPEC §2).
+    public var isTranscribing: Bool {
+        transcriptionState != .idle || transcriptionQueue != nil
+    }
 
     /// Seconds of audio captured so far. Refreshed by the ticker while
     /// recording — the engine's live value isn't Observable, so the views read
@@ -79,31 +90,60 @@ public final class AppState {
     /// a live meter, cheap enough to run for a 75-minute lecture.
     private static let recordingTickInterval: TimeInterval = 0.2
 
-    private let sessions: SessionController
+    /// Internal (not private) so tests can verify the config's recording
+    /// knobs reached the controller the default init built.
+    let sessions: SessionController
     private let configStore: ConfigStore
     private let sessionStore: SessionStore
     private let transcription: TranscriptionController
     private let ticker: any Ticker
     private let quitFlow: any QuitFlow
+    private let launchAtLogin: any LaunchAtLogin
     /// Token identifying the running job so late progress hops from a finished
     /// job can't overwrite the state after it resets (SPEC §6).
     private var transcriptionJob: URL?
 
+    /// `sessions` is optional because the default controller can't be built
+    /// until `config.json` has been read — the file's recording knobs
+    /// (`gainDB`, `autoStopMinutes`) are baked into the engine/controller
+    /// at construction. Callers injecting a controller (tests) already
+    /// chose their knobs.
     public init(
-        sessions: SessionController = SessionController(),
+        sessions: SessionController? = nil,
         configStore: ConfigStore? = nil,
         sessionStore: SessionStore? = nil,
         transcription: TranscriptionController? = nil,
         ticker: any Ticker = TimerTicker(),
-        quitFlow: any QuitFlow = AppQuitFlow()
+        quitFlow: any QuitFlow = AppQuitFlow(),
+        launchAtLogin: any LaunchAtLogin = SMAppServiceLaunchAtLogin()
     ) {
-        self.sessions = sessions
-        self.configStore = configStore ?? ConfigStore(archive: sessions.archive)
-        self.sessionStore = sessionStore ?? SessionStore(archive: sessions.archive)
+        self.configStore = configStore
+            ?? ConfigStore(archive: sessions?.archive ?? Archive())
+        if let sessions {
+            self.sessions = sessions
+        } else {
+            // The config read has to happen here, before the controller
+            // exists — a missing/corrupt file falls back to the SPEC
+            // defaults (`Config.standard`), the same values a fresh file
+            // would have written.
+            let configured: Config
+            if case .ok(let config) = self.configStore.load() {
+                configured = config
+            } else {
+                configured = .standard
+            }
+            self.sessions = SessionController(
+                engine: MicRecordingEngine(gainDB: configured.gainDB),
+                archive: self.configStore.archive,
+                autoStopLimit: TimeInterval(configured.autoStopMinutes) * 60
+            )
+        }
+        self.sessionStore = sessionStore ?? SessionStore(archive: self.sessions.archive)
         self.transcription = transcription ?? TranscriptionController()
         self.ticker = ticker
         self.quitFlow = quitFlow
-        sessions.onSessionInterrupted = { [weak self] session in
+        self.launchAtLogin = launchAtLogin
+        self.sessions.onSessionInterrupted = { [weak self] session in
             guard let self,
                   case .recording(let current) = self.recordingState,
                   current == session else { return }
@@ -121,8 +161,9 @@ public final class AppState {
         // Recovery transcodes leftover `.caf` captures — real work, so it
         // runs off the init path and lands here when done.
         Task { [weak self] in
-            let recovered = await sessions.recoverInterruptedSessions()
-            self?.recoveredFiles = recovered
+            guard let self else { return }
+            let recovered = await self.sessions.recoverInterruptedSessions()
+            self.recoveredFiles = recovered
         }
     }
 
@@ -135,11 +176,14 @@ public final class AppState {
         return Config.standard.whisperModel
     }
 
-    /// Reloads `config.json` and re-resolves the Course list the menu renders.
-    /// Called at launch and on every menu open — no file-watcher needed
-    /// (SPEC §5). A corrupt file empties the Course list and surfaces a
-    /// warning; Quick Record keeps working either way.
+    /// Reloads `config.json`, re-resolves the Course list the menu renders,
+    /// and re-reads the Launch at Login registration (it can also change in
+    /// System Settings between opens). Called at launch and on every menu
+    /// open — no file-watcher needed (SPEC §5). A corrupt file empties the
+    /// Course list and surfaces a warning; Quick Record keeps working either
+    /// way.
     public func reloadConfig() {
+        launchAtLoginEnabled = launchAtLogin.isEnabled
         let state = configStore.load()
         configState = state
         guard case .ok(let config) = state else {
@@ -300,6 +344,21 @@ public final class AppState {
     public func editConfig() {
         reloadConfig()
         NSWorkspace.shared.open(configStore.fileURL)
+    }
+
+    /// Menu action: the `Launch at Login` toggle. Registers/unregisters the
+    /// app's bundle as a login item — the OS-side registration is the
+    /// persistence, so nothing is written to `config.json` (SPEC §5). A
+    /// failure (e.g. toggling from a bare `swift run` binary with no `.app`
+    /// to register) lands in `lastError`; either way the toggle re-reads
+    /// the true state.
+    public func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try launchAtLogin.setEnabled(enabled)
+        } catch {
+            lastError = error.localizedDescription
+        }
+        launchAtLoginEnabled = launchAtLogin.isEnabled
     }
 
     /// Menu action shown when mic permission is denied — deep-links to

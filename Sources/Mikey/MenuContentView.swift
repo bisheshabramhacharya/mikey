@@ -104,6 +104,11 @@ public struct MenuContentView: View {
         Button("Edit Courses (config.json)") {
             appState.editConfig()
         }
+        // Renders as a checkmarked item in a `.menu` MenuBarExtra (SPEC §2).
+        Toggle("Launch at Login", isOn: Binding(
+            get: { appState.launchAtLoginEnabled },
+            set: { appState.setLaunchAtLogin($0) }
+        ))
 
         Divider()
 
