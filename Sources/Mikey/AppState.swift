@@ -11,6 +11,15 @@ public final class AppState {
         case recording(Session)
     }
 
+    /// What the background transcription job is doing, for the menu's
+    /// progress line (SPEC §2). At most one job runs at a time.
+    public enum TranscriptionState: Equatable {
+        case idle
+        case downloadingModel(progress: Double)
+        case loadingModel
+        case transcribing(PendingSession, progress: Double)
+    }
+
     public private(set) var recordingState: RecordingState = .idle
     /// Human-readable failure shown in the menu (permission denied, no input
     /// device, …). Cleared on the next attempt.
@@ -20,16 +29,29 @@ public final class AppState {
     /// Courses resolved to Archive folders, in config order. Empty while the
     /// config is corrupt — Quick Record then stays the only record action.
     public private(set) var courseFolders: [CourseFolder] = []
+    /// Pending Sessions — `.m4a` with no sibling `.md` — newest first.
+    /// Re-derived from the Archive on every menu open (no stored state).
+    public private(set) var pendingSessions: [PendingSession] = []
+    public private(set) var transcriptionState: TranscriptionState = .idle
 
     private let sessions: SessionController
     private let configStore: ConfigStore
+    private let sessionStore: SessionStore
+    private let transcription: TranscriptionController
+    /// Token identifying the running job so late progress hops from a finished
+    /// job can't overwrite the state after it resets (SPEC §6).
+    private var transcriptionJob: URL?
 
     public init(
         sessions: SessionController = SessionController(),
-        configStore: ConfigStore? = nil
+        configStore: ConfigStore? = nil,
+        sessionStore: SessionStore? = nil,
+        transcription: TranscriptionController? = nil
     ) {
         self.sessions = sessions
         self.configStore = configStore ?? ConfigStore(archive: sessions.archive)
+        self.sessionStore = sessionStore ?? SessionStore(archive: sessions.archive)
+        self.transcription = transcription ?? TranscriptionController()
         // First launch: write `config.json` + lay out the Archive before the
         // menu is ever opened (SPEC §5).
         reloadConfig()
@@ -38,6 +60,13 @@ public final class AppState {
     public var archiveURL: URL { sessions.archiveURL }
     public var elapsedTime: TimeInterval { sessions.elapsedTime }
     public var inputLevel: Float { sessions.inputLevel }
+
+    /// The `whisperModel` from the last good config load; the standard value
+    /// stands in while the config is corrupt (SPEC §5 default).
+    private var whisperModel: String {
+        if case .ok(let config) = configState { return config.whisperModel }
+        return Config.standard.whisperModel
+    }
 
     /// Reloads `config.json` and re-resolves the Course list the menu renders.
     /// Called at launch and on every menu open — no file-watcher needed
@@ -48,12 +77,20 @@ public final class AppState {
         configState = state
         guard case .ok(let config) = state else {
             courseFolders = []
+            refreshPending()
             return
         }
         // Best-effort: if a folder can't be created now, the record action
         // surfaces the real error when the Session starts.
         try? sessions.archive.ensureLayout(courses: config.courses)
         courseFolders = sessions.archive.courseFolders(for: config.courses)
+        refreshPending()
+    }
+
+    /// Re-derives the pending list from the Archive. Called on menu open (via
+    /// `reloadConfig`), after a Session stops, and after a job finishes.
+    public func refreshPending() {
+        pendingSessions = sessionStore.pendingSessions(courseFolders: courseFolders)
     }
 
     /// Menu action: `▶ Quick Record`. Starts a courseless Session filed under
@@ -87,6 +124,48 @@ public final class AppState {
         guard case .recording(let session) = recordingState else { return }
         sessions.stopSession(session)
         recordingState = .idle
+        // The just-finished Recording is now pending a Transcript.
+        refreshPending()
+    }
+
+    /// Menu action: `Transcribe` on a pending Session. One job at a time —
+    /// a second tap while a job runs is a no-op (the menu also disables the
+    /// buttons). A decline on the model-download prompt leaves everything as
+    /// it was; a failure lands in `lastError` with the Session still pending.
+    public func transcribe(_ session: PendingSession) async {
+        guard transcriptionState == .idle else { return }
+        transcriptionJob = session.audioURL
+        transcriptionState = .transcribing(session, progress: 0)
+        defer {
+            transcriptionJob = nil
+            transcriptionState = .idle
+            refreshPending()
+        }
+        do {
+            _ = try await transcription.transcribe(
+                session,
+                model: whisperModel
+            ) { [weak self] phase in
+                let job = session.audioURL
+                Task { @MainActor [weak self] in
+                    guard let self, self.transcriptionJob == job else { return }
+                    self.applyPhase(phase, for: session)
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func applyPhase(_ phase: TranscriptionPhase, for session: PendingSession) {
+        switch phase {
+        case .downloadingModel(let fraction):
+            transcriptionState = .downloadingModel(progress: fraction)
+        case .loadingModel:
+            transcriptionState = .loadingModel
+        case .transcribing(let fraction):
+            transcriptionState = .transcribing(session, progress: fraction)
+        }
     }
 
     /// Menu action: `Open Archive Folder` — reveals the Archive in Finder.

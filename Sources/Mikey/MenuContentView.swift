@@ -37,6 +37,30 @@ public struct MenuContentView: View {
             }
         }
 
+        // Pending Sessions — Recordings without Transcripts (SPEC §2, §6).
+        // One Transcribe action each; "Transcribe All" is a later ticket.
+        if !appState.pendingSessions.isEmpty {
+            Divider()
+            Text("Pending")
+            ForEach(appState.pendingSessions) { session in
+                Button("Transcribe — \(session.menuLabel)") {
+                    Task { await appState.transcribe(session) }
+                }
+                .disabled(appState.transcriptionState != .idle)
+            }
+        }
+
+        switch appState.transcriptionState {
+        case .idle:
+            EmptyView()
+        case .downloadingModel(let progress):
+            Text("Downloading Whisper model… \(Int(progress * 100))%")
+        case .loadingModel:
+            Text("Loading Whisper model…")
+        case .transcribing(let session, let progress):
+            Text("\(session.menuLabel) — transcribing… \(Int(progress * 100))%")
+        }
+
         if let error = appState.lastError {
             Text(error)
         }

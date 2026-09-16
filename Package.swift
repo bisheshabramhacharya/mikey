@@ -36,11 +36,23 @@ let package = Package(
     products: [
         .executable(name: "Mikey", targets: ["MikeyApp"]),
     ],
+    dependencies: [
+        // On-device Whisper (SPEC §6). The package moved from
+        // argmaxinc/WhisperKit to the argmax-oss-swift monorepo; the
+        // `WhisperKit` product is unchanged.
+        .package(
+            url: "https://github.com/argmaxinc/argmax-oss-swift.git",
+            exact: "1.1.0"
+        ),
+    ],
     targets: [
         // All app logic + the SwiftUI menu views. A library so MikeyTests can
         // statically link and `@testable`-import it.
         .target(
             name: "Mikey",
+            dependencies: [
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
+            ],
             path: "Sources/Mikey",
             swiftSettings: testableDebug
         ),
