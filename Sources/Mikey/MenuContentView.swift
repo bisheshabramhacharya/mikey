@@ -42,7 +42,8 @@ public struct MenuContentView: View {
         }
 
         // Pending Sessions — Recordings without Transcripts (SPEC §2, §6).
-        // One Transcribe action each; "Transcribe All" is a later ticket.
+        // One Transcribe action each, plus "Transcribe All Pending" to drain
+        // the backlog serially once there's more than a single job.
         if !appState.pendingSessions.isEmpty {
             Divider()
             Text("Pending")
@@ -52,8 +53,17 @@ public struct MenuContentView: View {
                 }
                 .disabled(appState.transcriptionState != .idle)
             }
+            if appState.pendingSessions.count > 1 {
+                Button("Transcribe All Pending") {
+                    Task { await appState.transcribeAllPending() }
+                }
+                .disabled(appState.transcriptionState != .idle)
+            }
         }
 
+        if let queue = appState.transcriptionQueue {
+            Text("Transcription queue — job \(queue.active) of \(queue.total)")
+        }
         switch appState.transcriptionState {
         case .idle:
             EmptyView()

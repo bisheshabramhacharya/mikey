@@ -90,8 +90,17 @@ final class FakeTranscriber: Transcriber, @unchecked Sendable {
     var modelReady = false
     var isModelReadyCalls = 0
     var transcribeCalls = 0
+    /// Files `transcribe` ran on, in call order — queue tests read this for
+    /// oldest-first ordering.
+    private(set) var transcribedURLs: [URL] = []
     var stubbedOutput: TranscriptionOutput?
     var stubbedError: (any Error)?
+    /// Per-file failure hook, checked before `stubbedError` — lets a test
+    /// fail one job in a queue while the others succeed.
+    var errorForFile: ((URL) -> (any Error)?)?
+    /// Awaited after the phases report, before the output/error — lets a
+    /// test hold a job open mid-run (e.g. to record during a queue).
+    var holdOpen: ((URL) async -> Void)?
     /// Phases reported on each `transcribe` call, in order.
     var phasesToReport: [TranscriptionPhase] = []
     /// Models `isModelReady` reports ready for; `nil` → use `modelReady`.
@@ -108,8 +117,10 @@ final class FakeTranscriber: Transcriber, @unchecked Sendable {
         onPhase: @escaping @Sendable (TranscriptionPhase) -> Void
     ) async throws -> TranscriptionOutput {
         transcribeCalls += 1
+        transcribedURLs.append(url)
         for phase in phasesToReport { onPhase(phase) }
-        if let stubbedError { throw stubbedError }
+        if let holdOpen { await holdOpen(url) }
+        if let error = errorForFile?(url) ?? stubbedError { throw error }
         if let stubbedOutput { return stubbedOutput }
         return TranscriptionOutput(
             segments: [
