@@ -27,6 +27,19 @@ public final class AppState {
         case transcribing(PendingSession, progress: Double)
     }
 
+    /// Where a `Transcribe All Pending` run stands — `active` is the job
+    /// number in flight (1-based) out of the `total` snapshotted when the
+    /// run started. Rendered as "job N of M" in the menu (SPEC §2).
+    public struct QueueProgress: Equatable, Sendable {
+        public var active: Int
+        public var total: Int
+
+        public init(active: Int, total: Int) {
+            self.active = active
+            self.total = total
+        }
+    }
+
     public private(set) var recordingState: RecordingState = .idle
     /// Human-readable failure shown in the menu (permission denied, no input
     /// device, …). Cleared on the next attempt.
@@ -46,6 +59,10 @@ public final class AppState {
     /// Re-derived from the Archive on every menu open (no stored state).
     public private(set) var pendingSessions: [PendingSession] = []
     public private(set) var transcriptionState: TranscriptionState = .idle
+    /// Where a `Transcribe All Pending` run stands, for the menu's
+    /// "job N of M" line. `nil` when no queue is running; a single
+    /// `transcribe(_:)` doesn't set it.
+    public private(set) var transcriptionQueue: QueueProgress?
 
     /// Seconds of audio captured so far. Refreshed by the ticker while
     /// recording — the engine's live value isn't Observable, so the views read
@@ -194,7 +211,47 @@ public final class AppState {
     /// buttons). A decline on the model-download prompt leaves everything as
     /// it was; a failure lands in `lastError` with the Session still pending.
     public func transcribe(_ session: PendingSession) async {
+        _ = await runTranscriptionJob(session)
+    }
+
+    /// Menu action: `Transcribe All Pending`. Drains the pending backlog
+    /// serially, oldest first, through the same one-job path — a tap while a
+    /// job runs is a no-op (SPEC §6).
+    ///
+    /// The set is snapshotted at tap time: a Recording that lands mid-queue
+    /// waits for the next trigger, and each job re-checks its Transcript is
+    /// still missing before running, so a re-triggered run picks up exactly
+    /// where an interrupted one left off. A thrown job is reported in
+    /// `lastError`, stays pending, and the queue moves on. A declined
+    /// model-download prompt stops the whole run — every job left needs the
+    /// same download, so re-prompting per file would just nag.
+    public func transcribeAllPending() async {
         guard transcriptionState == .idle else { return }
+        defer { transcriptionQueue = nil }
+        let queue = pendingSessions.sorted { $0.startedAt < $1.startedAt }
+        for (index, session) in queue.enumerated() {
+            transcriptionQueue = QueueProgress(active: index + 1, total: queue.count)
+            guard !FileManager.default.fileExists(
+                atPath: session.transcriptURL.path(percentEncoded: false)
+            ) else { continue }
+            switch await runTranscriptionJob(session) {
+            case .declined?:
+                return
+            default:
+                continue
+            }
+        }
+    }
+
+    /// The one-job path shared by `transcribe(_:)` and the queue: the
+    /// serialization guard, the `transcriptionJob` token, progress hops, and
+    /// the error → `lastError` mapping. Returns the job's outcome — `nil` on
+    /// a throw — so the queue can tell a declined download prompt from a
+    /// failure it should move past.
+    private func runTranscriptionJob(
+        _ session: PendingSession
+    ) async -> TranscriptionController.Outcome? {
+        guard transcriptionState == .idle else { return nil }
         transcriptionJob = session.audioURL
         transcriptionState = .transcribing(session, progress: 0)
         defer {
@@ -203,7 +260,7 @@ public final class AppState {
             refreshPending()
         }
         do {
-            _ = try await transcription.transcribe(
+            return try await transcription.transcribe(
                 session,
                 model: whisperModel
             ) { [weak self] phase in
@@ -215,6 +272,7 @@ public final class AppState {
             }
         } catch {
             lastError = error.localizedDescription
+            return nil
         }
     }
 
